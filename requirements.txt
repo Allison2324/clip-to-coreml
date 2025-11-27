@@ -5,3 +5,4 @@ open_clip_torch
 pillow
 tqdm
 onnx==1.14.0
+onnx-coreml
