@@ -1,10 +1,10 @@
 import time
-import os
-import math
+from pathlib import Path
 
 import numpy as np
 import torch
 import coremltools as ct
+from coremltools.converters import onnx as onnx_converter
 import open_clip
 
 
@@ -14,131 +14,108 @@ PRETRAINED = "laion2b_s34b_b88k"
 BATCH_SIZE = 32
 IMAGE_SIZE = 224
 
-ONNX_PATH = f"clip_image_encoder_{MODEL_NAME}_B{BATCH_SIZE}.onnx"
-OUT_NAME = f"ClipImageEncoder_{MODEL_NAME}_B{BATCH_SIZE}"
-MLPACKAGE_PATH = f"{OUT_NAME}.mlpackage"
+ONNX_PATH = Path("clip_image_encoder_ViT-B-16_B32.onnx")
+OUTPUT_COREML = Path("ClipImageEncoder_ViT-B-16_B32.mlpackage")
+
+
+def format_time(seconds: float) -> str:
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    else:
+        return f"{m:02d}:{s:02d}"
 
 
 class ImageEncoder(torch.nn.Module):
-    def __init__(self, model):
+    def __init__(self, clip_model: torch.nn.Module):
         super().__init__()
-        self.model = model
+        self.clip_model = clip_model
+        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], dtype=torch.float32).view(1, 3, 1, 1)
+        std = torch.tensor([0.26862954, 0.26130258, 0.27577711], dtype=torch.float32).view(1, 3, 1, 1)
+        self.register_buffer("mean", mean)
+        self.register_buffer("std", std)
 
-    def forward(self, x):
-        feats = self.model.encode_image(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = (x - self.mean) / self.std
+        feats = self.clip_model.encode_image(x)
         feats = feats / feats.norm(dim=-1, keepdim=True).clamp_min(1e-6)
         return feats
 
 
-def fmt_time(sec: float) -> str:
-    sec = float(sec)
-    h = int(sec // 3600)
-    m = int((sec % 3600) // 60)
-    s = int(sec % 60)
-    if h > 0:
-        return f"{h:d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
-
-
 def main():
-    t0 = time.time()
-
-    print("Step 0/4: environment info")
-    print(f"torch:        {torch.__version__}")
-    print(f"coremltools:  {ct.__version__}")
-    try:
-        print(f"open_clip:    {open_clip.__version__}")
-    except Exception:
-        print("open_clip:    (no __version__ attr)")
-    print(f"model name:   {MODEL_NAME}")
-    print(f"pretrained:   {PRETRAINED}")
-    print(f"batch size:   {BATCH_SIZE}")
-    print(f"image size:   {IMAGE_SIZE}x{IMAGE_SIZE}")
-    print(f"onnx path:    {ONNX_PATH}")
-    print(f"output name:  {OUT_NAME}.mlpackage")
-    print("------------------------------------------------------------", flush=True)
-
-    # ---------------------------------------
-    # Step 1: загрузка CLIP
-    # ---------------------------------------
-    t1 = time.time()
-    print("Step 1/4: loading CLIP model...")
-
     device = "cpu"
-    model, _, _ = open_clip.create_model_and_transforms(
+
+    print("Step 0/4: environment info", flush=True)
+    print(f"torch:        {torch.__version__}", flush=True)
+    print(f"coremltools:  {ct.__version__}", flush=True)
+    oc_ver = getattr(open_clip, "__version__", "unknown")
+    print(f"open_clip:    {oc_ver}", flush=True)
+    print(f"model name:   {MODEL_NAME}", flush=True)
+    print(f"pretrained:   {PRETRAINED}", flush=True)
+    print(f"batch size:   {BATCH_SIZE}", flush=True)
+    print(f"image size:   {IMAGE_SIZE}x{IMAGE_SIZE}", flush=True)
+    print(f"onnx path:    {ONNX_PATH}", flush=True)
+    print(f"output name:  {OUTPUT_COREML}", flush=True)
+    print("-" * 60, flush=True)
+
+    print("Step 1/4: loading CLIP model...", flush=True)
+    t1 = time.time()
+    clip_model, _, _ = open_clip.create_model_and_transforms(
         MODEL_NAME,
         pretrained=PRETRAINED,
-        device=device
+        device=device,
     )
-    model.eval()
-    encoder = ImageEncoder(model).eval()
+    clip_model.eval()
+    print(f"Step 1/4 done in {format_time(time.time() - t1)}", flush=True)
 
+    print("Step 2/4: building encoder and running dummy forward + ONNX export...", flush=True)
     t2 = time.time()
-    print(f"Step 1/4 done in {fmt_time(t2 - t1)}", flush=True)
+    encoder = ImageEncoder(clip_model).to(device)
+    encoder.eval()
 
-    # ---------------------------------------
-    # Step 2: dummy-прогон и экспорт в ONNX
-    # ---------------------------------------
-    print("Step 2/4: building encoder and running dummy forward + ONNX export...")
-
-    dummy = torch.randn(BATCH_SIZE, 3, IMAGE_SIZE, IMAGE_SIZE, device=device)
+    dummy = torch.randn(BATCH_SIZE, 3, IMAGE_SIZE, IMAGE_SIZE, dtype=torch.float32, device=device)
     with torch.no_grad():
         out = encoder(dummy)
 
     out_shape = tuple(out.shape)
     emb_dim = out_shape[-1]
-    total_params = sum(p.numel() for p in encoder.parameters())
+    n_params = sum(p.numel() for p in encoder.parameters())
 
-    print(f"Encoder dummy input shape: {tuple(dummy.shape)}")
-    print(f"Encoder output shape:      {out_shape}")
-    print(f"Embedding dim:             {emb_dim}")
-    print(f"Total parameters:          {total_params:,}")
+    print(f"Encoder dummy input shape: {tuple(dummy.shape)}", flush=True)
+    print(f"Encoder output shape:      {out_shape}", flush=True)
+    print(f"Embedding dim:             {emb_dim}", flush=True)
+    print(f"Total parameters:          {n_params:,}", flush=True)
 
-    t2a = time.time()
-    print("Exporting to ONNX...")
+    print("Exporting to ONNX...", flush=True)
     torch.onnx.export(
         encoder,
         dummy,
-        ONNX_PATH,
+        str(ONNX_PATH),
         input_names=["image"],
         output_names=["embedding"],
-        dynamic_axes={
-            "image": {0: "batch"},
-            "embedding": {0: "batch"},
-        },
         opset_version=17,
         do_constant_folding=True,
+        dynamic_axes=None,
     )
-    t3 = time.time()
-    print(f"ONNX exported to:          {ONNX_PATH}")
-    print(f"Step 2/4 done in {fmt_time(t3 - t2)}", flush=True)
+    print(f"ONNX exported to:          {ONNX_PATH}", flush=True)
+    print(f"Step 2/4 done in {format_time(time.time() - t2)}", flush=True)
 
-    # ---------------------------------------
-    # Step 3: конвертация ONNX -> CoreML
-    # ---------------------------------------
     print("Step 3/4: converting ONNX to CoreML (this step can take a long time)...", flush=True)
-
-    mlmodel = ct.convert(
-        ONNX_PATH,
-        source="onnx",
-        minimum_deployment_target=ct.target.iOS15,
-        compute_units=ct.ComputeUnit.ALL,
+    t3 = time.time()
+    mlmodel = onnx_converter.convert(
+        model=str(ONNX_PATH)
     )
+    print(f"Step 3/4 done in {format_time(time.time() - t3)}", flush=True)
 
+    print("Step 4/4: saving CoreML model...", flush=True)
     t4 = time.time()
-    print(f"Step 3/4 done in {fmt_time(t4 - t3)}", flush=True)
-
-    # ---------------------------------------
-    # Step 4: сохранение mlpackage
-    # ---------------------------------------
-    print("Step 4/4: saving CoreML model...")
-    mlmodel.save(MLPACKAGE_PATH)
-    t5 = time.time()
-    print(f"CoreML model saved to:     {MLPACKAGE_PATH}")
-    print(f"Step 4/4 done in {fmt_time(t5 - t4)}", flush=True)
-
-    print("------------------------------------------------------------")
-    print(f"Total time: {fmt_time(t5 - t0)}")
+    mlmodel.save(str(OUTPUT_COREML))
+    print(f"Saved CoreML model to:     {OUTPUT_COREML}", flush=True)
+    print(f"Step 4/4 done in {format_time(time.time() - t4)}", flush=True)
+    print("All done.", flush=True)
 
 
 if __name__ == "__main__":
