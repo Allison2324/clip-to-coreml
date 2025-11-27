@@ -4,3 +4,4 @@ coremltools==7.1
 open_clip_torch
 pillow
 tqdm
+pip install onnx==1.14.0
