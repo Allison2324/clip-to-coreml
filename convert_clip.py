@@ -1,5 +1,4 @@
 import time
-import math
 import types
 
 import numpy as np
@@ -13,8 +12,8 @@ MODEL_NAME = "ViT-B-16"
 PRETRAINED = "laion2b_s34b_b88k"
 BATCH_SIZE = 32
 IMAGE_SIZE = 224
-OUT_PATH = "ClipImageEncoder_ViT-B-16_B32.mlpackage"
 TS_PATH = "clip_image_encoder_ViT-B-16_B32.pt"
+OUT_PATH = "ClipImageEncoder_ViT-B-16_B32.mlpackage"
 
 
 def log(msg: str):
@@ -27,106 +26,97 @@ class ImageEncoder(nn.Module):
         self.model = clip_model
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, 3, 224, 224), float32, в диапазоне [0, 1] с нормализацией внутри CoreML уже не делаем
         return self.model.encode_image(x)
 
 
-class MyMultiheadAttention(nn.Module):
-    def __init__(self, mha: nn.MultiheadAttention):
-        super().__init__()
-        self.embed_dim = mha.embed_dim
-        self.num_heads = mha.num_heads
-        self.dropout = mha.dropout
-        self.batch_first = getattr(mha, "batch_first", False)
-
-        self.in_proj_weight = nn.Parameter(mha.in_proj_weight.detach().clone())
-        if mha.in_proj_bias is not None:
-            self.in_proj_bias = nn.Parameter(mha.in_proj_bias.detach().clone())
-        else:
-            self.in_proj_bias = nn.Parameter(torch.zeros(3 * self.embed_dim))
-
-        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
-        with torch.no_grad():
-            self.out_proj.weight.copy_(mha.out_proj.weight.detach())
-            if mha.out_proj.bias is not None:
-                self.out_proj.bias.copy_(mha.out_proj.bias.detach())
-            else:
-                self.out_proj.bias.zero_()
-
-        self.attn_drop = nn.Dropout(self.dropout if self.dropout is not None else 0.0)
-        self.proj_drop = nn.Dropout(self.dropout if self.dropout is not None else 0.0)
-
-    def forward(self, x, key_padding_mask=None, need_weights=False, attn_mask=None):
-        if not self.batch_first:
-            x = x.transpose(0, 1)  # (N, S, E)
-        N, S, E = x.shape
-
-        qkv = torch.nn.functional.linear(x, self.in_proj_weight, self.in_proj_bias)
-        q, k, v = qkv.chunk(3, dim=-1)
-
-        head_dim = E // self.num_heads
-        scale = head_dim ** -0.5
-
-        q = q.view(N, S, self.num_heads, head_dim).transpose(1, 2)
-        k = k.view(N, S, self.num_heads, head_dim).transpose(1, 2)
-        v = v.view(N, S, self.num_heads, head_dim).transpose(1, 2)
-
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-
-        if attn_mask is not None:
-            attn = attn + attn_mask
-
-        attn = torch.softmax(attn, dim=-1)
-        attn = self.attn_drop(attn)
-
-        y = torch.matmul(attn, v)
-        y = y.transpose(1, 2).contiguous().view(N, S, E)
-
-        y = self.out_proj(y)
-        y = self.proj_drop(y)
-
-        if not self.batch_first:
-            y = y.transpose(0, 1)
-
-        if need_weights:
-            w = attn.mean(dim=1)
-            return y, w
-        return y
-
-
-def patch_attention_modules(clip_model: nn.Module) -> int:
+def patch_residual_attention_blocks(clip_model: nn.Module) -> int:
+    """
+    Переопределяем метод attention в ResidualAttentionBlock так, чтобы
+    он НЕ использовал nn.MultiheadAttention.forward (и, соответственно,
+    не вызывал _native_multi_head_attention), а делал attention руками.
+    """
     patched = 0
-    for module in clip_model.modules():
-        if module.__class__.__name__ == "Attention" and hasattr(module, "qkv") and hasattr(module, "num_heads"):
-            def forward(self, x):
-                B, N, C = x.shape
-                qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
-                qkv = qkv.permute(2, 0, 3, 1, 4)
-                q, k, v = qkv[0], qkv[1], qkv[2]
-                head_dim = C // self.num_heads
+
+    for m in clip_model.modules():
+        if (
+            m.__class__.__name__ == "ResidualAttentionBlock"
+            and hasattr(m, "attn")
+            and isinstance(m.attn, nn.MultiheadAttention)
+        ):
+            mha = m.attn
+
+            def attention(self, q_x, k_x=None, v_x=None, attn_mask=None):
+                mha_local = self.attn
+                batch_first = getattr(mha_local, "batch_first", False)
+                embed_dim = mha_local.embed_dim
+                num_heads = mha_local.num_heads
+                head_dim = embed_dim // num_heads
                 scale = head_dim ** -0.5
-                attn = (q @ k.transpose(-2, -1)) * scale
-                attn = attn.softmax(dim=-1)
-                attn = self.attn_drop(attn)
-                x = attn @ v
-                x = x.transpose(1, 2).reshape(B, N, C)
-                x = self.proj(x)
-                x = self.proj_drop(x)
-                return x
 
-            module.forward = types.MethodType(forward, module)
+                if k_x is None:
+                    k_x = q_x
+                if v_x is None:
+                    v_x = k_x
+
+                # Приводим к batch_first=(B, T, C)
+                if batch_first:
+                    q = q_x
+                    k = k_x
+                    v = v_x
+                else:
+                    # (T, B, C) -> (B, T, C)
+                    q = q_x.transpose(0, 1)
+                    k = k_x.transpose(0, 1)
+                    v = v_x.transpose(0, 1)
+
+                W = mha_local.in_proj_weight    # (3*E, E)
+                b = mha_local.in_proj_bias      # (3*E,) или None
+                if W is None:
+                    raise ValueError("Expected in_proj_weight in MultiheadAttention")
+
+                w_q, w_k, w_v = W.chunk(3, dim=0)
+                if b is not None:
+                    b_q, b_k, b_v = b.chunk(3, dim=0)
+                else:
+                    b_q = b_k = b_v = None
+
+                q = torch.nn.functional.linear(q, w_q, b_q)
+                k = torch.nn.functional.linear(k, w_k, b_k)
+                v = torch.nn.functional.linear(v, w_v, b_v)
+
+                B, T_q, _ = q.shape
+                _, T_k, _ = k.shape
+
+                q = q.view(B, T_q, num_heads, head_dim).transpose(1, 2)  # (B, H, T_q, d)
+                k = k.view(B, T_k, num_heads, head_dim).transpose(1, 2)  # (B, H, T_k, d)
+                v = v.view(B, T_k, num_heads, head_dim).transpose(1, 2)  # (B, H, T_k, d)
+
+                attn = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, T_q, T_k)
+
+                if attn_mask is not None:
+                    # Ожидаем broadcast совместимый attn_mask.
+                    attn = attn + attn_mask
+
+                attn = torch.softmax(attn, dim=-1)
+                attn = torch.nn.functional.dropout(
+                    attn, p=mha_local.dropout, training=self.training
+                )
+
+                y = torch.matmul(attn, v)  # (B, H, T_q, d)
+                y = y.transpose(1, 2).contiguous().view(B, T_q, embed_dim)  # (B, T_q, E)
+
+                y = mha_local.out_proj(y)  # (B, T_q, E)
+
+                if not batch_first:
+                    y = y.transpose(0, 1)  # обратно в (T, B, E)
+
+                return y
+
+            m.attention = types.MethodType(attention, m)
             patched += 1
+
     return patched
-
-
-def replace_multihead_attention(clip_model: nn.Module) -> int:
-    replaced = 0
-    for module in clip_model.modules():
-        for child_name, child in list(module.named_children()):
-            if isinstance(child, nn.MultiheadAttention) or child.__class__.__name__.lower().endswith("multiheadattention"):
-                new_mha = MyMultiheadAttention(child)
-                setattr(module, child_name, new_mha)
-                replaced += 1
-    return replaced
 
 
 def main():
@@ -146,12 +136,13 @@ def main():
     device = "cpu"
     torch.set_grad_enabled(False)
 
+    # 1. Загружаем CLIP
     log("Step 1/4: loading CLIP model...")
     t1 = time.time()
     clip_model, _, _ = open_clip.create_model_and_transforms(
         MODEL_NAME,
         pretrained=PRETRAINED,
-        device=device
+        device=device,
     )
     clip_model.eval()
     clip_model.to(device)
@@ -159,14 +150,12 @@ def main():
     total_params = sum(p.numel() for p in clip_model.parameters())
     log(f"Total parameters (CLIP): {total_params:,}")
 
-    patched_att = patch_attention_modules(clip_model)
-    log(f"Patched Attention modules: {patched_att}")
-
-    replaced_mha = replace_multihead_attention(clip_model)
-    log(f"Replaced MultiheadAttention modules: {replaced_mha}")
+    patched_ra = patch_residual_attention_blocks(clip_model)
+    log(f"Patched ResidualAttentionBlock.attention: {patched_ra}")
 
     log(f"Step 1/4 done in {time.time() - t1:.1f} s")
 
+    # 2. Оборачиваем в ImageEncoder и трассим в TorchScript
     log("Step 2/4: building image encoder wrapper and tracing TorchScript...")
     t2 = time.time()
     encoder = ImageEncoder(clip_model)
@@ -179,7 +168,7 @@ def main():
         IMAGE_SIZE,
         IMAGE_SIZE,
         dtype=torch.float32,
-        device=device
+        device=device,
     )
 
     with torch.no_grad():
@@ -200,26 +189,28 @@ def main():
     log(f"TorchScript saved to:      {TS_PATH}")
     log(f"Step 2/4 done in {time.time() - t2:.1f} s")
 
+    # 3. Конвертация TorchScript -> CoreML
     log("Step 3/4: converting TorchScript to CoreML (this step can take a long time)...")
     t3 = time.time()
 
     image_input = ct.TensorType(
         name="image",
-        shape=dummy.shape,
-        dtype=np.float32
+        shape=dummy.shape,  # (32, 3, 224, 224)
+        dtype=np.float32,
     )
 
     mlmodel = ct.convert(
         ts_encoder,
+        source="pytorch",
         inputs=[image_input],
         convert_to="mlprogram",
-        compute_units=ct.ComputeUnit.ALL,
         minimum_deployment_target=ct.target.iOS16,
-        source="pytorch"
+        compute_units=ct.ComputeUnit.ALL,
     )
 
     log(f"Step 3/4 done in {time.time() - t3:.1f} s")
 
+    # 4. Сохранение mlpackage
     log("Step 4/4: saving CoreML model...")
     t4 = time.time()
     mlmodel.save(OUT_PATH)
