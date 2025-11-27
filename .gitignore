@@ -1,0 +1,5 @@
+venv/
+__pycache__/
+*.mlpackage
+*.mlmodel
+.DS_Store
