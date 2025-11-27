@@ -1,0 +1,6 @@
+numpy<2
+torch==2.1.0
+coremltools==7.1
+open_clip_torch
+pillow
+tqdm
