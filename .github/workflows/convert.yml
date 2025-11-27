@@ -1,4 +1,4 @@
-name: convert-clip-to-coreml
+name: Convert CLIP to CoreML
 
 on:
   push:
@@ -9,26 +9,26 @@ on:
 
 jobs:
   convert:
-    runs-on: macos-latest
+    runs-on: macos-15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.9
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.9"
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "numpy<2" "torch==2.1.0" "coremltools==6.3" "open-clip-torch==3.2.0" "onnx>=1.14,<1.17"
+          pip install "numpy<2" "torch==2.1.0" "open_clip_torch==3.2.0" "coremltools==7.1"
 
-      - name: Convert CLIP to CoreML
+      - name: Run conversion
         run: python convert_clip.py
 
-      - name: Upload CoreML model artifact
+      - name: Upload CoreML artifact
         uses: actions/upload-artifact@v4
         with:
           name: ClipImageEncoder_ViT-B-16_B32

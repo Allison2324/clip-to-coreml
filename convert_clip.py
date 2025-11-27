@@ -1,119 +1,144 @@
 import time
+import math
+import types
+
+import numpy as np
 import torch
+import torch.nn as nn
 import coremltools as ct
 import open_clip
-from coremltools.converters.onnx import convert as onnx_to_coreml
+
 
 MODEL_NAME = "ViT-B-16"
 PRETRAINED = "laion2b_s34b_b88k"
 BATCH_SIZE = 32
-INPUT_RES = 224
-
-ONNX_PATH = f"clip_image_encoder_{MODEL_NAME}_B{BATCH_SIZE}.onnx"
-OUT_NAME = f"ClipImageEncoder_{MODEL_NAME}_B{BATCH_SIZE}.mlpackage"
-
-
-def fmt_hms(sec: float) -> str:
-    sec = max(0.0, float(sec))
-    h = int(sec // 3600)
-    m = int((sec % 3600) // 60)
-    s = int(sec % 60)
-    if h > 0:
-        return f"{h:d}:{m:02d}:{s:02d}"
-    return f"{m:d}:{s:02d}"
+IMAGE_SIZE = 224
+OUT_PATH = "ClipImageEncoder_ViT-B-16_B32.mlpackage"
 
 
 def log(msg: str):
     print(msg, flush=True)
 
 
-class ImageEncoder(torch.nn.Module):
-    def __init__(self, clip_model: torch.nn.Module):
+class ImageEncoder(nn.Module):
+    def __init__(self, clip_model: nn.Module):
         super().__init__()
-        self.clip_model = clip_model
+        self.model = clip_model
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dtype != torch.float32:
-            x = x.to(torch.float32)
-        return self.clip_model.encode_image(x)
+        return self.model.encode_image(x)
+
+
+def patch_attention_modules(model: nn.Module) -> int:
+    patched = 0
+
+    for name, module in model.named_modules():
+        if module.__class__.__name__ == "Attention" and hasattr(module, "qkv") and hasattr(module, "num_heads"):
+            def forward(self, x):
+                B, N, C = x.shape
+                qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
+                qkv = qkv.permute(2, 0, 3, 1, 4)
+                q, k, v = qkv[0], qkv[1], qkv[2]
+                head_dim = C // self.num_heads
+                scale = head_dim ** -0.5
+                attn = (q @ k.transpose(-2, -1)) * scale
+                attn = attn.softmax(dim=-1)
+                attn = self.attn_drop(attn)
+                x = attn @ v
+                x = x.transpose(1, 2).reshape(B, N, C)
+                x = self.proj(x)
+                x = self.proj_drop(x)
+                return x
+
+            module.forward = types.MethodType(forward, module)
+            patched += 1
+
+    log(f"Patched Attention modules: {patched}")
+    return patched
 
 
 def main():
+    t0 = time.time()
     log("Step 0/4: environment info")
-    oc_ver = getattr(open_clip, "__version__", "unknown")
     log(f"torch:        {torch.__version__}")
     log(f"coremltools:  {ct.__version__}")
-    log(f"open_clip:    {oc_ver}")
+    log(f"open_clip:    {getattr(open_clip, '__version__', 'unknown')}")
     log(f"model name:   {MODEL_NAME}")
     log(f"pretrained:   {PRETRAINED}")
     log(f"batch size:   {BATCH_SIZE}")
-    log(f"image size:   {INPUT_RES}x{INPUT_RES}")
-    log(f"onnx path:    {ONNX_PATH}")
-    log(f"output name:  {OUT_NAME}")
+    log(f"image size:   {IMAGE_SIZE}x{IMAGE_SIZE}")
+    log(f"output path:  {OUT_PATH}")
     log("-" * 60)
 
-    t0 = time.time()
+    device = "cpu"
+
+    # Step 1: загрузка CLIP
     log("Step 1/4: loading CLIP model...")
+    t1 = time.time()
     clip_model, _, _ = open_clip.create_model_and_transforms(
         MODEL_NAME,
         pretrained=PRETRAINED,
-        device="cpu",
+        device=device
     )
     clip_model.eval()
-    clip_model = clip_model.to(dtype=torch.float32)
-    log(f"Step 1/4 done in {fmt_hms(time.time() - t0)}")
+    clip_model.to(device)
+    total_params = sum(p.numel() for p in clip_model.parameters())
+    log(f"Total parameters (CLIP): {total_params:,}")
+    patch_attention_modules(clip_model)
+    log(f"Step 1/4 done in {time.time() - t1:.1f} s")
 
-    t1 = time.time()
-    log("Step 2/4: building encoder and running dummy forward + ONNX export...")
+    # Step 2: обёртка + dummy forward
+    log("Step 2/4: building image encoder wrapper and running dummy forward...")
+    t2 = time.time()
     encoder = ImageEncoder(clip_model)
     encoder.eval()
+    encoder.to(device)
 
     dummy = torch.randn(
         BATCH_SIZE,
         3,
-        INPUT_RES,
-        INPUT_RES,
+        IMAGE_SIZE,
+        IMAGE_SIZE,
         dtype=torch.float32,
+        device=device
     )
-
     with torch.no_grad():
         out = encoder(dummy)
-
+    out_shape = tuple(out.shape)
+    embed_dim = out_shape[-1]
     log(f"Encoder dummy input shape: {tuple(dummy.shape)}")
-    log(f"Encoder output shape:      {tuple(out.shape)}")
-    emb_dim = int(out.shape[-1])
-    total_params = sum(p.numel() for p in encoder.parameters())
-    log(f"Embedding dim:             {emb_dim}")
-    log(f"Total parameters:          {total_params:,}")
+    log(f"Encoder output shape:      {out_shape}")
+    log(f"Embedding dim:             {embed_dim}")
+    enc_params = sum(p.numel() for p in encoder.parameters())
+    log(f"Total parameters (encoder): {enc_params:,}")
+    log(f"Step 2/4 done in {time.time() - t2:.1f} s")
 
-    log("Exporting to ONNX...")
-    torch.onnx.export(
-        encoder,
-        dummy,
-        ONNX_PATH,
-        input_names=["image"],
-        output_names=["embedding"],
-        opset_version=17,
-        do_constant_folding=True,
-        dynamic_axes=None,
-    )
-    log(f"ONNX exported to:          {ONNX_PATH}")
-    log(f"Step 2/4 done in {fmt_hms(time.time() - t1)}")
-
-    t2 = time.time()
-    log("Step 3/4: converting ONNX to CoreML (this step can take a long time)...")
-    mlmodel = onnx_to_coreml(
-        model=ONNX_PATH,
-        minimum_ios_deployment_target="15",
-    )
-    log(f"Step 3/4 done in {fmt_hms(time.time() - t2)}")
-
+    # Step 3: PyTorch → CoreML
+    log("Step 3/4: converting PyTorch model to CoreML (this step can take a long time)...")
     t3 = time.time()
+    image_input = ct.TensorType(
+        name="image",
+        shape=dummy.shape,
+        dtype=np.float32
+    )
+    mlmodel = ct.convert(
+        encoder,
+        inputs=[image_input],
+        convert_to="mlprogram",
+        compute_units=ct.ComputeUnit.ALL,
+        minimum_deployment_target=ct.target.iOS16,
+        source="pytorch"
+    )
+    log(f"Step 3/4 done in {time.time() - t3:.1f} s")
+
+    # Step 4: сохранение
     log("Step 4/4: saving CoreML model...")
-    mlmodel.save(OUT_NAME)
-    log(f"Saved CoreML model to:     {OUT_NAME}")
-    log(f"Step 4/4 done in {fmt_hms(time.time() - t3)}")
-    log("All done.")
+    t4 = time.time()
+    mlmodel.save(OUT_PATH)
+    log(f"Model saved to: {OUT_PATH}")
+    log(f"Step 4/4 done in {time.time() - t4:.1f} s")
+
+    log(f"Total time: {time.time() - t0:.1f} s")
 
 
 if __name__ == "__main__":
