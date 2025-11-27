@@ -1,0 +1,33 @@
+name: Convert CLIP to CoreML
+
+on:
+  workflow_dispatch:
+
+jobs:
+  convert:
+    runs-on: macos-13
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run conversion script
+        run: |
+          python convert_clip.py
+
+      - name: Upload CoreML model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clip-image-encoder-vit-b-16
+          path: ClipImageEncoder_ViT-B-16_B32.mlpackage
+          if-no-files-found: error
