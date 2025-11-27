@@ -5,9 +5,6 @@ on:
     branches:
       - main
       - master
-    paths:
-      - "convert_clip.py"
-      - ".github/workflows/convert.yml"
   workflow_dispatch:
 
 jobs:
@@ -18,15 +15,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.9
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.9"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "numpy<2" "torch==2.1.0" "coremltools==7.1" "open-clip-torch==3.2.0" "onnx>=1.14,<1.17"
+          pip install "numpy<2" "torch==2.1.0" "coremltools==6.3" "open-clip-torch==3.2.0" "onnx>=1.14,<1.17"
 
       - name: Convert CLIP to CoreML
         run: python convert_clip.py

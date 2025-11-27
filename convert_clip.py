@@ -1,10 +1,8 @@
 import time
-import numpy as np
 import torch
 import coremltools as ct
-import onnx
 import open_clip
-
+from coremltools.converters.onnx import convert as onnx_to_coreml
 
 MODEL_NAME = "ViT-B-16"
 PRETRAINED = "laion2b_s34b_b88k"
@@ -104,14 +102,9 @@ def main():
 
     t2 = time.time()
     log("Step 3/4: converting ONNX to CoreML (this step can take a long time)...")
-    onnx_model = onnx.load(ONNX_PATH)
-
-    mlmodel = ct.convert(
-        onnx_model,
-        convert_to="mlprogram",
-        minimum_deployment_target=ct.target.iOS15,
-        compute_units=ct.ComputeUnit.ALL,
-        # inputs можно не указывать: формы берутся из ONNX-графа
+    mlmodel = onnx_to_coreml(
+        model=ONNX_PATH,
+        minimum_ios_deployment_target="15",
     )
     log(f"Step 3/4 done in {fmt_hms(time.time() - t2)}")
 
